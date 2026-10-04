@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bisect
+import math
 import re
 import threading
 from dataclasses import dataclass, field
@@ -62,10 +63,68 @@ def normalize_route(path: str, route_paths: set[str]) -> str:
 
 
 def latency_bucket_index(latency_seconds: float) -> int:
-    """Return the histogram bucket index for a latency observation."""
+    """Return the histogram bucket index for a latency observation.
+
+    Boundary ownership follows the documented contract: an observation
+    exactly equal to a bucket upper bound belongs to the bucket *named
+    after that bound* (``latency <= upper_bound``). Hence the first
+    bound ``>= latency`` is picked via ``bisect_left``; only values
+    strictly above the largest finite bound fall into the ``+Inf``
+    bucket.
+    """
     if latency_seconds < 0:
         latency_seconds = 0.0
-    return bisect.bisect_right(LATENCY_BUCKETS, latency_seconds)
+    return bisect.bisect_left(LATENCY_BUCKETS, latency_seconds)
+
+
+def histogram_quantile(buckets: list[int], q: float) -> float | None:
+    """Approximate quantile ``q`` (in ``[0, 1]``) from histogram counts.
+
+    The histogram stores no raw observations, so the result is an
+    approximation using the **upper-bound method with linear
+    interpolation inside the located bucket**:
+
+    * buckets hold counts with upper bounds ``LATENCY_BUCKETS`` and a
+      trailing ``+Inf`` bucket; ``i``-th bucket is
+      ``(prev_bound, bound_i]`` (the first starts at ``0``);
+    * the target rank is ``q * total``; scan cumulative counts to the
+      first bucket whose cumulative count is ``>=`` that rank;
+    * inside a finite bucket the value is interpolated linearly between
+      its lower and upper bound by the fraction of the bucket consumed;
+    * if the located bucket is ``+Inf`` no finite upper bound exists, so
+      ``math.inf`` is returned (meaning "above the largest measured
+      bound");
+    * with zero observations the quantile is undefined and ``None`` is
+      returned.
+
+    This makes median / p95 / p99 cheap to compute for on-call triage
+    without keeping per-request samples, at the cost of precision: the
+    approximation error is bounded by the width of the located bucket.
+    """
+    if not 0.0 <= q <= 1.0:
+        raise ValueError("q must be within [0, 1]")
+    total = sum(buckets)
+    if total == 0:
+        return None
+    target = q * total
+    cumulative = 0
+    for index, count in enumerate(buckets):
+        cumulative += count
+        if count and cumulative >= target:
+            if index == 0:
+                lower = 0.0
+            else:
+                lower = LATENCY_BUCKETS[index - 1]
+            if index >= len(LATENCY_BUCKETS):
+                # Located inside the +Inf bucket: no finite bound.
+                return math.inf
+            upper = LATENCY_BUCKETS[index]
+            before = cumulative - count
+            fraction = (target - before) / count if count else 0.0
+            # Keep interpolation inside [lower, upper] even for floats.
+            fraction = min(1.0, max(0.0, fraction))
+            return lower + (upper - lower) * fraction
+    return math.inf  # pragma: no cover - cumulative == total must hit a bucket
 
 
 class MetricsRegistry:
@@ -107,3 +166,34 @@ class MetricsRegistry:
         """Total number of recorded requests across all label sets."""
         with self._lock:
             return sum(value.count for value in self._data.values())
+
+    def series_quantile(
+        self,
+        route: str,
+        method: str,
+        status_code: int,
+        q: float,
+    ) -> float | None:
+        """Approximate quantile of one label set's latency histogram.
+
+        Returns ``None`` when the label set (or observations) does not
+        exist; ``math.inf`` when the quantile falls in the ``+Inf``
+        bucket.
+        """
+        with self._lock:
+            series = self._data.get((route, method, status_code))
+            if series is None:
+                return None
+            return histogram_quantile(series.latency_buckets, q)
+
+    def quantile_snapshot(
+        self, quantiles: tuple[float, ...] = (0.5, 0.95, 0.99)
+    ) -> dict[tuple[str, str, int], dict[float, float | None]]:
+        """Consistent snapshot of approximate quantiles per label set."""
+        with self._lock:
+            return {
+                key: {
+                    q: histogram_quantile(value.latency_buckets, q) for q in quantiles
+                }
+                for key, value in self._data.items()
+            }

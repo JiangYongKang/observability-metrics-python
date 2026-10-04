@@ -127,3 +127,164 @@ def test_alert_states_endpoint_is_deterministic_initially():
 
     states = asyncio.run(run())
     assert states == {"slow_request_rate": "ok", "error_rate": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Alert evaluation history endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_alert_history_endpoint_reports_inputs_and_verdicts(caplog):
+    app = create_app(min_samples=2, fire_threshold=0.8, recover_threshold=0.2)
+
+    async def run() -> None:
+        async with make_client(app) as client:
+            await client.get("/boom")  # 1/1 violation but not enough samples
+            await client.get("/boom")  # 2/2 -> fires
+
+    with caplog.at_level(logging.INFO, logger="observability"):
+        asyncio.run(run())
+
+    async def query() -> dict:
+        async with make_client(app) as client:
+            return (await client.get("/alerts/error_rate/history?limit=10")).json()
+
+    payload = asyncio.run(query())
+    assert payload["alert"] == "error_rate"
+    assert payload["state"] == "firing"
+    records = payload["records"]
+    assert len(records) == 2
+    newest = records[0]
+    assert newest["current"] == payload["state"]
+    # Inputs of the decision.
+    assert newest["violated"] is True
+    assert newest["window_size"] == 2
+    assert newest["min_samples"] == 2
+    assert newest["fire_threshold"] == 0.8
+    assert newest["recover_threshold"] == 0.2
+    # Verdict of the decision.
+    assert newest["transitioned"] is True
+    assert newest["insufficient_samples"] is False
+    assert records[1]["insufficient_samples"] is True
+    assert records[1]["transitioned"] is False
+
+
+def test_alert_history_unknown_alert_returns_404():
+    app = create_app()
+
+    async def run() -> int:
+        async with make_client(app) as client:
+            return (await client.get("/alerts/nope/history")).status_code
+
+    assert asyncio.run(run()) == 404
+
+
+def test_alert_history_is_read_only_and_consistent_with_state():
+    app = create_app(min_samples=1, fire_threshold=0.1, recover_threshold=0.01)
+
+    async def run() -> None:
+        async with make_client(app) as client:
+            for _ in range(3):
+                await client.get("/boom")
+
+    asyncio.run(run())
+    alerts = app.state.alerts
+
+    state, records = alerts.state_and_history("error_rate")
+    assert records[0].current is state
+    seqs = [r.sequence for r in records]
+    assert seqs == sorted(seqs, reverse=True)
+    assert len(seqs) == len(set(seqs))
+    # A second read returns the same content (read-only snapshot).
+    state2, records2 = alerts.state_and_history("error_rate")
+    assert state is state2
+    assert [r.sequence for r in records2] == seqs
+
+
+# ---------------------------------------------------------------------------
+# Percentiles in the metrics snapshot
+# ---------------------------------------------------------------------------
+
+
+def test_metrics_snapshot_exposes_approximate_percentiles():
+    app = create_app()
+
+    async def run() -> dict:
+        async with make_client(app) as client:
+            for _ in range(10):
+                await client.get("/")
+            return (await client.get("/metrics")).json()
+
+    payload = asyncio.run(run())
+    root = [s for s in payload["series"] if s["route"] == "/"][0]
+    assert root["count"] == 10
+    assert sum(root["latency_buckets"]) == 10
+    q = root["latency_quantiles"]
+    assert set(q) == {"p50", "p95", "p99"}
+    assert q["p50"] is not None and q["p95"] is not None and q["p99"] is not None
+    assert q["p50"] <= q["p95"] <= q["p99"]
+
+
+def test_plus_inf_quantile_serializes_as_null():
+    app = create_app()
+    # /slow sleeps beyond the 5.0 largest finite bucket via monkeypatched
+    # threshold is hard; instead verify via registry directly with huge data.
+    registry = app.state.registry
+    for _ in range(3):
+        registry.record("/x", "GET", 200, 10_000.0)
+
+    async def run() -> dict:
+        async with make_client(app) as client:
+            return (await client.get("/metrics")).json()
+
+    series = [s for s in asyncio.run(run())["series"] if s["route"] == "/x"][0]
+    assert series["latency_buckets"][-1] == 3
+    # JSON cannot carry Infinity; the snapshot renders it as null.
+    assert series["latency_quantiles"]["p50"] is None
+
+
+# ---------------------------------------------------------------------------
+# Every alert evaluation is traceable in the service's structured logs
+# ---------------------------------------------------------------------------
+
+
+def test_alert_evaluation_log_line_is_structured_json(caplog):
+    app = create_app(min_samples=1, fire_threshold=0.5, recover_threshold=0.2)
+
+    async def run() -> None:
+        async with make_client(app) as client:
+            await client.get("/boom")
+
+    with caplog.at_level(logging.INFO, logger="observability"):
+        asyncio.run(run())
+
+    from app.logging import JsonLineFormatter
+
+    formatter = JsonLineFormatter()
+    lines = [
+        json.loads(formatter.format(r))
+        for r in caplog.records
+        if r.message.startswith("alert evaluation")
+    ]
+    # Two rules evaluated per request, each with full inputs + verdict.
+    by_alert = {line["alert"]: line for line in lines}
+    for name in ("slow_request_rate", "error_rate"):
+        line = by_alert[name]
+        assert line["event"] == "alert_evaluation"
+        for field in (
+            "timestamp",
+            "violated",
+            "value",
+            "window_size",
+            "fire_threshold",
+            "recover_threshold",
+            "min_samples",
+            "previous",
+            "current",
+            "transitioned",
+            "suppressed_by_cooldown",
+            "insufficient_samples",
+        ):
+            assert field in line, field
+    assert by_alert["error_rate"]["current"] == "firing"
+    assert by_alert["error_rate"]["transitioned"] is True
